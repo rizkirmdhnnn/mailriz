@@ -44,52 +44,21 @@ import { applyMigrations } from './migrate';
 import { resolveToken, sourceHint, validateToken, type TokenSources } from './token';
 import { spawnAndWait } from './proc';
 import { hashPassword, generateSigningKey } from '@mailriz/shared';
+import {
+  slugifyDomain,
+  configPathFor,
+  deriveResourceNames,
+  listConfigs,
+  type MultiConfig,
+} from './config';
 
 const execFileP = promisify(execFile);
 const CONFIG_DIR = join(homedir(), '.mailriz');
-const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
-/** Worker, D1 database and bucket prefix are all fixed — one install per account. */
-const WORKER_NAME = 'mailriz';
+const DEFAULT_CONFIG_PATH = join(CONFIG_DIR, 'config.json');
 const TMP_DIR = join(CONFIG_DIR, '.temp');
 const RELEASE_URL = 'https://github.com/rizkirmdhnnn/mailriz/releases/latest/download/mailriz-worker.tar.gz';
 
-interface Config {
-  account_id: string;
-  zone_id: string;
-  zone_name: string;
-  worker_name: string;
-  dashboard_hostname: string;
-  admin_email: string;
-  d1_database_id: string;
-  r2_raw_bucket: string;
-  r2_attachments_bucket: string;
-  r2_html_bucket: string;
-  auth_mode: 'access' | 'session';
-  /** Persisted so `update` can redeploy without blanking the Worker's Access
-   *  vars — an empty ACCESS_AUD makes it reject every request. */
-  access_aud?: string;
-  access_team_domain?: string;
-  /** Needed to delete the application on teardown. Older installs recorded
-   *  only the aud tag, so destroy recovers the id by matching instead. */
-  access_app_id?: string;
-  /**
-   * Whether `setup` was the thing that turned Email Routing on for this zone.
-   *
-   * Disabling it removes the MX, SPF and DKIM records Cloudflare added, which
-   * is right when MailRiz put them there and wrong when the zone already
-   * routed mail. Absent on installs from before this was recorded, and
-   * destroy asks rather than guessing.
-   */
-  email_routing_enabled_by_setup?: boolean;
-  /**
-   * Only present when the operator opted in during setup. It carries delete
-   * rights over the Worker, D1 and R2, so it is never stored silently — and
-   * the file is written 0600.
-   */
-  api_token?: string;
-  installed_at: string;
-}
-
+type Config = MultiConfig;
 /**
  * Resolve the token for a command that runs against an existing install.
  *
@@ -122,18 +91,58 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
-async function loadConfig(): Promise<Config | null> {
-  try {
-    const raw = await readFile(CONFIG_PATH, 'utf8');
-    return JSON.parse(raw) as Config;
-  } catch {
-    return null;
-  }
+async function selectOrCreateConfig(zoneName?: string): Promise<string> {
+  return configPathFor(CONFIG_DIR, zoneName);
 }
 
-async function saveConfig(cfg: Config): Promise<void> {
+async function loadConfig(specifiedDomain?: string): Promise<Config | null> {
+  const configs = await listConfigs(CONFIG_DIR);
+  if (configs.length === 0) {
+    try {
+      const raw = await readFile(DEFAULT_CONFIG_PATH, 'utf8');
+      const parsed = JSON.parse(raw) as Config;
+      parsed._filePath = DEFAULT_CONFIG_PATH;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  if (specifiedDomain) {
+    const match = configs.find(
+      (c) =>
+        c.zone_name.toLowerCase() === specifiedDomain.toLowerCase() ||
+        c.dashboard_hostname.toLowerCase() === specifiedDomain.toLowerCase() ||
+        c.worker_name.toLowerCase() === specifiedDomain.toLowerCase()
+    );
+    return match || null;
+  }
+
+  if (configs.length === 1) {
+    return configs[0]!;
+  }
+
+  // Multiple configs exist: interactive select
+  blank();
+  const chosen = (await select({
+    message: 'Multiple MailRiz installations found. Select which one:',
+    options: configs.map((c) => ({
+      value: c._filePath || configPathFor(CONFIG_DIR, c.zone_name),
+      label: `${c.zone_name} (${c.dashboard_hostname}) [Worker: ${c.worker_name}]`,
+    })),
+  })) as string;
+  if (isCancel(chosen)) process.exit(0);
+
+  const matched = configs.find((c) => (c._filePath || configPathFor(CONFIG_DIR, c.zone_name)) === chosen);
+  return matched || null;
+}
+
+async function saveConfig(cfg: Config): Promise<string> {
   await mkdir(CONFIG_DIR, { recursive: true });
-  await writeFile(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  const targetPath = cfg._filePath || configPathFor(CONFIG_DIR, cfg.zone_name);
+  await writeFile(targetPath, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  cfg._filePath = targetPath;
+  return targetPath;
 }
 
 // ---------------------------------------------------------------- release fetch
@@ -317,34 +326,11 @@ async function cmdSetup() {
   // Refuse to run over a live installation: setup provisions and then
   // overwrites config.json wholesale, so a second run against a different
   // zone would strand the first one's Worker, Custom Domain and Access
-  // application with nothing left on disk pointing at them.
-  if (existsSync(CONFIG_PATH)) {
-    const installed = await loadConfig();
-    if (!installed) {
-      commandHeader('setup');
-      aborted(`${CONFIG_PATH} exists but could not be read.`);
-      hint('It names the Worker, database and buckets of an installation that is');
-      hint('probably still running. Overwriting it would strand them, so repair or');
-      hint('move the file aside deliberately before running setup.');
-      blank();
-      process.exit(1);
-    }
-    commandHeader('setup', installed.dashboard_hostname);
-    aborted('MailRiz is already installed.');
-    rows([
-      ['dashboard', `https://${installed.dashboard_hostname}`],
-      ['inbox', `anything@${installed.zone_name}`],
-      ['installed', new Date(installed.installed_at).toLocaleString()],
-      ['state', CONFIG_PATH],
-    ]);
-    blank();
-    hint('To change auth, the admin email or a broken Access application,');
-    hint(`run ${accent('mailriz-cli reconfigure')} — it reuses this installation.`);
-    blank();
-    hint(`To start over, run ${accent('mailriz-cli destroy')} first. That deletes`);
-    hint('every stored message, so export anything you want to keep.');
-    blank();
-    process.exit(1);
+  // Check if an install already exists for this specific domain or default
+  const allConfigs = await listConfigs(CONFIG_DIR);
+  const existingDefault = existsSync(DEFAULT_CONFIG_PATH) ? await loadConfig() : null;
+  if (existingDefault && allConfigs.length === 0) {
+    // Legacy single installation present
   }
 
   // ---- pre-flight, before anything is asked of the user
@@ -366,8 +352,8 @@ async function cmdSetup() {
   } catch { cfReachable = false; }
   checkRow(cfReachable, 'cloudflare', cfReachable ? 'api reachable' : 'unreachable — check your network');
 
-  // The guard above already returned if anything was there.
-  checkRow(true, 'state', `will be created at ${CONFIG_PATH}`);
+  // The state file will be placed in the config directory.
+  checkRow(true, 'state', `will be created in ${CONFIG_DIR}`);
 
   try {
     const { stdout } = await execFileP('bun', ['--version']);
@@ -481,26 +467,38 @@ async function cmdSetup() {
   }
   const zoneId = zoneObj.id;
 
-  // A deployment can outlive the file describing it — config.json deleted, or
-  // an earlier setup stopped after deploying. The guard above only sees the
-  // local file.
+  // Check if an existing configuration exists for this zone
+  const targetConfigPath = configPathFor(CONFIG_DIR, zoneObj.name);
+  if (existsSync(targetConfigPath)) {
+    commandHeader('setup', zoneObj.name);
+    aborted(`MailRiz is already installed for ${zoneObj.name}.`);
+    hint(`Config file exists at: ${targetConfigPath}`);
+    hint(`To reconfigure, run: mailriz-cli reconfigure`);
+    hint(`To destroy, run: mailriz-cli destroy`);
+    blank();
+    process.exit(1);
+  }
+
+  // Determine resource naming (domain-scoped)
+  const resourceNames = deriveResourceNames(zoneObj.name);
+  const workerName = resourceNames.workerName;
+
   blank();
   const takenOver = await spin(
     'existing install',
     async () => {
       const scripts = await listWorkerScripts(effectiveToken, accountId).catch(() => []);
-      return scripts.some((s) => s.id === WORKER_NAME);
+      return scripts.some((s) => s.id === workerName);
     },
-    (found) => (found ? `a "${WORKER_NAME}" Worker already exists here` : 'none found')
+    (found) => (found ? `a "${workerName}" Worker already exists here` : 'none found')
   );
   if (takenOver) {
     blank();
-    hint(`This account already runs a Worker named "${WORKER_NAME}", but there is no`);
-    hint(`${CONFIG_PATH} describing it.`);
+    hint(`This account already runs a Worker named "${workerName}", but there is no`);
+    hint(`${targetConfigPath} describing it.`);
     blank();
     hint('Continuing redeploys that Worker, repoints it at the hostname you pick');
-    hint('next, and reuses the existing mailriz database and buckets — which');
-    hint('breaks whichever installation is using them now.');
+    hint('next, and reuses the existing mailriz database and buckets for this domain.');
     blank();
     const proceed = (await confirm({
       message: 'Take over the existing deployment?',
@@ -509,10 +507,6 @@ async function cmdSetup() {
     if (isCancel(proceed)) process.exit(0);
     if (!proceed) {
       aborted('Left alone — nothing was changed.');
-      hint('If this deployment is yours and you want it gone, restore its');
-      hint('config.json and run `destroy`, or remove the Worker, D1 database and');
-      hint('mailriz-* buckets from the Cloudflare dashboard first.');
-      blank();
       process.exit(1);
     }
   }
@@ -582,9 +576,10 @@ async function cmdSetup() {
 
   // ---- provisioning: one live task block owns the screen from here on.
   // Nothing interactive may print until tasks.stop(); warnings are queued and
-  // shown underneath so long text can't tear the redrawn rows.
-  const workerName = WORKER_NAME;
-
+  const d1Name = resourceNames.d1Name;
+  const r2RawName = resourceNames.r2Raw;
+  const r2AttName = resourceNames.r2Att;
+  const r2HtmlName = resourceNames.r2Html;
   blank();
   commandHeader('setup', `${accountObj.name} / ${zoneObj.name}`);
 
@@ -637,17 +632,17 @@ async function cmdSetup() {
   let d1;
   try {
     const d1s = await listD1(effectiveToken, accountId);
-    d1 = d1s.find((d) => d.name === 'mailriz');
-    if (!d1) d1 = await createD1(effectiveToken, accountId, 'mailriz');
+    d1 = d1s.find((d) => d.name === d1Name);
+    if (!d1) d1 = await createD1(effectiveToken, accountId, d1Name);
     // A database without a uuid would otherwise flow into the query URL and
     // the wrangler binding as "undefined" and fail much further along.
     if (!d1.uuid) throw new Error('D1 API returned a database without a uuid');
-  } catch (e: any) {
-    tasks.failTask('d1', e.message);
-    abort(`D1 provisioning failed: ${e.message}`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    tasks.failTask('d1', msg);
+    abort(`D1 provisioning failed: ${msg}`);
   }
-  tasks.ok('d1', `mailriz (${d1.uuid.slice(0, 8)})`);
-
+  tasks.ok('d1', `${d1Name} (${d1.uuid.slice(0, 8)})`);
   // Migrations.
   tasks.run('migrations', `checking ${migrations.length}…`);
   let appliedNow: string[] = [];
@@ -685,9 +680,9 @@ async function cmdSetup() {
     const r2s = await listR2Buckets(effectiveToken, accountId);
     const ensure = async (name: string) =>
       r2s.find((b) => b.name === name) || await createR2Bucket(effectiveToken, accountId, name);
-    r2Raw = await ensure('mailriz-raw');
-    r2Att = await ensure('mailriz-attachments');
-    r2Html = await ensure('mailriz-html');
+    r2Raw = await ensure(r2RawName);
+    r2Att = await ensure(r2AttName);
+    r2Html = await ensure(r2HtmlName);
   } catch (e: any) {
     tasks.failTask('r2', e.message);
     abort(`R2 provisioning failed: ${e.message}`);
@@ -800,8 +795,9 @@ async function cmdSetup() {
     initialValue: false,
   })) as boolean;
   if (isCancel(saveToken)) process.exit(0);
+  const savedConfigPath = configPathFor(CONFIG_DIR, zoneObj.name);
   if (saveToken) {
-    hint(`  Stored in ${CONFIG_PATH} (chmod 600). Delete the file to revoke it locally.`);
+    hint(`  Stored in ${savedConfigPath} (chmod 600). Delete the file to revoke it locally.`);
   } else {
     hint('  Not saved. Later commands read $CLOUDFLARE_API_TOKEN, or ask you to paste it.');
   }
@@ -825,13 +821,13 @@ async function cmdSetup() {
     email_routing_enabled_by_setup: routingEnabledByUs,
     installed_at: new Date().toISOString(),
   };
-  await saveConfig(cfg);
+  const finalConfigPath = await saveConfig(cfg);
 
   finished('MailRiz is live', [
     ['dashboard', accent(`https://${dashboardHostname}`)],
     ['inbox', `anything@${zoneObj.name}`],
     ['auth', authMode === 'access' ? `Cloudflare Access · ${adminEmail}` : `password · ${adminEmail}`],
-    ['state', `${CONFIG_PATH} (chmod 600)`],
+    ['state', `${finalConfigPath} (chmod 600)`],
   ], 'Send yourself a mail at any address on the domain — it lands in the dashboard.');
 }
 
@@ -907,12 +903,12 @@ function readdirSorted(dir: string): Promise<string[]> {
 
 // ---------------------------------------------------------------- status
 
-async function cmdStatus() {
+async function cmdStatus(domain?: string) {
   banner();
-  const cfg = await loadConfig();
+  const cfg = await loadConfig(domain);
   if (!cfg) fail('Not installed. Run `mailriz-cli setup` first.');
-
   commandHeader('status', cfg.dashboard_hostname);
+  const configPath = cfg._filePath || configPathFor(CONFIG_DIR, cfg.zone_name);
   rows([
     ['dashboard', `https://${cfg.dashboard_hostname}`],
     ['inbox', `anything@${cfg.zone_name}`],
@@ -931,7 +927,7 @@ async function cmdStatus() {
     ['worker', cfg.worker_name],
     ['d1', cfg.d1_database_id.slice(0, 8)],
     // Never the value — just whether a credential is sitting in the file.
-    ['api token', cfg.api_token ? `saved in ${CONFIG_PATH}` : 'not saved'],
+    ['api token', cfg.api_token ? `saved in ${configPath}` : 'not saved'],
     ['installed', new Date(cfg.installed_at).toLocaleString()],
   ]);
   blank();
@@ -954,9 +950,9 @@ async function cmdStatus() {
 
 // ---------------------------------------------------------------- update
 
-async function cmdUpdate() {
+async function cmdUpdate(domain?: string) {
   banner();
-  const cfg = await loadConfig();
+  const cfg = await loadConfig(domain);
   if (!cfg) fail('Not installed. Run `mailriz-cli setup` first.');
 
   commandHeader('update', cfg.dashboard_hostname);
@@ -1111,9 +1107,9 @@ async function cmdUpdate() {
  * recorded account, zone, database and buckets, and touches only what a
  * repair needs — auth, admin email, Access application, deployed Worker.
  */
-async function cmdReconfigure() {
+async function cmdReconfigure(domain?: string) {
   banner();
-  const cfg = await loadConfig();
+  const cfg = await loadConfig(domain);
   if (!cfg) fail('Not installed. Run `mailriz-cli setup` first.');
 
   commandHeader('reconfigure', cfg.dashboard_hostname);
@@ -1334,9 +1330,9 @@ async function cmdReconfigure() {
 // ---------------------------------------------------------------- destroy
 
 
-async function cmdDestroy() {
+async function cmdDestroy(domain?: string) {
   banner();
-  const cfg = await loadConfig();
+  const cfg = await loadConfig(domain);
   if (!cfg) fail('Not installed.');
 
   commandHeader('destroy', cfg.dashboard_hostname);
@@ -1408,7 +1404,8 @@ async function cmdDestroy() {
   if (cfg.auth_mode === 'access') {
     rows([['access', inv.accessAppId ? `application ${inv.accessAppId.slice(0, 8)}` : pc.dim('no application found')]]);
   }
-  rows([['state', CONFIG_PATH]]);
+  const targetConfigPath = cfg._filePath || configPathFor(CONFIG_DIR, cfg.zone_name);
+  rows([['state', targetConfigPath]]);
 
   // The buckets are the part people do not picture: D1 holds the metadata,
   // R2 holds the messages themselves.
@@ -1618,9 +1615,20 @@ async function cmdDestroy() {
   // so removing it while anything survives makes the leftovers unfindable.
   const clean = failures.length === 0 && leftover.length === 0;
   tasks.run('state', 'removing config…');
+
   if (clean) {
     try {
-      await rm(CONFIG_PATH, { force: true });
+      await rm(targetConfigPath, { force: true });
+      // Also clean up default config if it pointed to this
+      if (targetConfigPath !== DEFAULT_CONFIG_PATH && existsSync(DEFAULT_CONFIG_PATH)) {
+        try {
+          const defRaw = await readFile(DEFAULT_CONFIG_PATH, 'utf8');
+          const defObj = JSON.parse(defRaw);
+          if (defObj.zone_name === cfg.zone_name || defObj.worker_name === cfg.worker_name) {
+            await rm(DEFAULT_CONFIG_PATH, { force: true });
+          }
+        } catch {}
+      }
       // The extracted release otherwise sits in ~/.mailriz/.temp indefinitely.
       await rm(TMP_DIR, { recursive: true, force: true });
       tasks.ok('state', 'config and cached release removed');
@@ -1654,8 +1662,7 @@ async function cmdDestroy() {
   aborted('Teardown incomplete — nothing was assumed deleted.');
   for (const f of failures) bullet(f);
   for (const l of leftover) bullet(`still present: ${l}`);
-  blank();
-  hint(`${CONFIG_PATH} was kept so you can run destroy again once the cause is`);
+  hint(`${targetConfigPath} was kept so you can run destroy again once the cause is`);
   hint('fixed — usually a token missing a scope, or one that has been revoked.');
   blank();
   process.exit(1);
@@ -1684,12 +1691,13 @@ function cmdHelp(unknown?: string): void {
 }
 
 const cmd = process.argv[2] || 'setup';
+const targetDomain = process.argv[3];
 
 if (cmd === 'setup') cmdSetup();
-else if (cmd === 'status') cmdStatus();
-else if (cmd === 'update') cmdUpdate();
-else if (cmd === 'reconfigure') cmdReconfigure();
-else if (cmd === 'destroy') cmdDestroy();
+else if (cmd === 'status') cmdStatus(targetDomain);
+else if (cmd === 'update') cmdUpdate(targetDomain);
+else if (cmd === 'reconfigure') cmdReconfigure(targetDomain);
+else if (cmd === 'destroy') cmdDestroy(targetDomain);
 else if (['help', '--help', '-h'].includes(cmd)) cmdHelp();
 else {
   cmdHelp(cmd);
